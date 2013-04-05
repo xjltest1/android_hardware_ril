@@ -166,10 +166,19 @@ static int s_started = 0;
 
 static int s_fdListen = -1;
 
-static char rild[MAX_SOCKET_NAME_LENGTH] = {0};
-static int s_maxNumClients = MAX_NUM_CLIENTS;
+enum FDStatus {
+    FD_STATUS_INACTIVE = 0,
+    FD_STATUS_ACTIVE
+};
+
+typedef struct {
+    int fd;
+    FDStatus fd_status;
+}Client_fds;
 
 static int s_fdCommand[MAX_NUM_CLIENTS] ={-1,-1};
+RecordStream *p_rs[MAX_NUM_CLIENTS]={NULL};
+static Client_fds client_fds[MAX_NUM_CLIENTS] ={-1, FD_STATUS_INACTIVE, -1, FD_STATUS_INACTIVE};
 static int s_fdDebug = -1;
 
 static int s_fdWakeupRead;
@@ -202,9 +211,17 @@ static UserCallbackInfo *s_last_wake_timeout_info = NULL;
 static void *s_lastNITZTimeData = NULL;
 static size_t s_lastNITZTimeDataSize;
 
+static char rild[MAX_SOCKET_NAME_LENGTH] = {0};
+static int s_maxNumClients = MAX_NUM_CLIENTS;
+
 #if RILC_LOG
     static char printBuf[PRINTBUF_SIZE];
 #endif
+
+static pthread_mutex_t s_6610AtMutex = PTHREAD_MUTEX_INITIALIZER;
+extern "C" void lock6610At();
+extern "C" void unlock6610At();
+
 
 /*******************************************************************/
 
@@ -264,6 +281,8 @@ extern "C" const char * requestToString(int request);
 extern "C" const char * failCauseToString(RIL_Errno);
 extern "C" const char * callStateToString(RIL_CallState);
 extern "C" const char * radioStateToString(RIL_RadioState);
+extern "C" int isMultiSimEnabled();
+extern "C" int isMultiRild();
 
 #ifdef RIL_SHLIB
 extern "C" void RIL_onUnsolicitedResponse(int unsolResponse, void *data,
@@ -302,6 +321,51 @@ int RIL_getMaxNumClients() {
 extern "C"
 void RIL_setMaxNumClients(int num_clients) {
     s_maxNumClients = num_clients;
+}
+
+void printfds() {
+    for(int i = 0; i < MAX_NUM_CLIENTS; i++) {
+        ALOGD("fd=%d,.....status=%d",client_fds[i].fd,client_fds[i].fd_status);
+    }
+}
+
+static int addClientFd(int fd) {
+    int ret = -1;
+    if (isMultiSimEnabled() && !isMultiRild()) {
+        // DSDS with single rild case
+        for(int i = 0; i < MAX_NUM_CLIENTS; i++) {
+            if (client_fds[i].fd_status == FD_STATUS_INACTIVE) {
+                client_fds[i].fd = fd;
+                client_fds[i].fd_status = FD_STATUS_ACTIVE;
+                ret = i;
+                break;
+            }
+        }
+    } else {
+        // Non DSDS case or DSDS with Multi rild case.
+        /* We need to clean the stale broken socket fd, otherwise,
+           there will be file descriptor leakage */
+        if (client_fds[DEFAULT_SUB].fd_status == FD_STATUS_ACTIVE) {
+            close(client_fds[DEFAULT_SUB].fd);
+        }
+
+        client_fds[DEFAULT_SUB].fd = fd;
+        client_fds[DEFAULT_SUB].fd_status = FD_STATUS_ACTIVE;
+        ret = DEFAULT_SUB;
+    }
+    printfds();
+    return ret;
+}
+
+static int mapClientFD(int fd) {
+    int ret = -1;
+    for(int i = 0; i < MAX_NUM_CLIENTS; i++) {
+        if ( client_fds[i].fd_status == FD_STATUS_ACTIVE && client_fds[i].fd == fd ) {
+            ret = i;
+            break;
+        }
+    }
+    return ret;
 }
 
 /* For older RILs that do not support new commands RIL_REQUEST_VOICE_RADIO_TECH and
@@ -2514,17 +2578,17 @@ static void onCommandsSocketClosed() {
 }
 
 static void processCommandsCallback(int fd, short flags, void *param) {
-    void *p_record;
-    RecordStreamInfo *p_rsInfo;
+    void *p_record;  //RecordStream *p_rs is moved to global varibale
     size_t recordlen;
     int ret;
 
-    p_rsInfo = (RecordStreamInfo *)param;
-    assert(fd == s_fdCommand[p_rsInfo->client_id]);
+    int client_id = mapClientFD(fd);
+    assert(fd == s_fdCommand[client_id]);
+    p_rs[client_id] = (RecordStream *)param;
 
     for (;;) {
         /* loop until EAGAIN/EINTR, end of stream, or other error */
-        ret = record_stream_get_next(p_rsInfo->p_rs, &p_record, &recordlen);
+        ret = record_stream_get_next(p_rs[client_id], &p_record, &recordlen);
 
         if (ret == 0 && p_record == NULL) {
             /* end-of-stream */
@@ -2532,7 +2596,7 @@ static void processCommandsCallback(int fd, short flags, void *param) {
         } else if (ret < 0) {
             break;
         } else if (ret == 0) { /* && p_record != NULL */
-            processCommandBuffer(p_record, recordlen, p_rsInfo->client_id);
+            processCommandBuffer(p_record, recordlen, client_id);
         }
     }
 
@@ -2544,13 +2608,13 @@ static void processCommandsCallback(int fd, short flags, void *param) {
             ALOGW("EOS.  Closing command socket.");
         }
 
-        close(s_fdCommand[p_rsInfo->client_id]);
-        s_fdCommand[p_rsInfo->client_id] = -1;
+        close(s_fdCommand[client_id]);
+        s_fdCommand[client_id] = -1;
+        client_fds[client_id].fd_status = FD_STATUS_INACTIVE;
 
-        ril_event_del(&s_commands_event[p_rsInfo->client_id]);
+        ril_event_del(&s_commands_event[client_id]);
 
-        record_stream_free(p_rsInfo->p_rs);
-	free(p_rsInfo);
+        record_stream_free(p_rs[client_id]);
 
 	// s_listen_event is persistent. So, delete the listen event from
 	// the watch list so that it doesn't get piled up.
@@ -2564,7 +2628,8 @@ static void processCommandsCallback(int fd, short flags, void *param) {
 }
 
 
-static void onNewCommandConnect(int client_id) {
+static void onNewCommandConnect(int fd) {
+    int client_id = mapClientFD(fd);
     // Inform we are connected and the ril version
     int rilVer = s_callbacks[client_id].version;
     RIL_onUnsolicitedSendResponse(RIL_UNSOL_RIL_CONNECTED,
@@ -2615,8 +2680,17 @@ static void listenCallback (int fd, short flags, void *param) {
     assert (fd == s_fdListen);
 
     fd = accept(s_fdListen, (sockaddr *) &peeraddr, &socklen);
+    int client_id = addClientFd(fd);
+    ALOGD("client id:%d", client_id);
+    if(client_id == -1) {
+        ALOGD("Max no of clients reached");
+        close(fd);
+        return ;
+    } else {
+        s_fdCommand[client_id] = fd;
+    }
 
-    if (fd < 0 ) {
+    if (s_fdCommand[client_id] < 0 ) {
         ALOGE("Error on accept() errno:%d", errno);
         // s_listen_event is persistent. So, delete the listen event from
 	// the watch list so that it doesn't get piled up.
@@ -2632,7 +2706,7 @@ static void listenCallback (int fd, short flags, void *param) {
     errno = 0;
     is_phone_socket = 0;
 
-    err = getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &creds, &szCreds);
+    err = getsockopt(s_fdCommand[client_id], SOL_SOCKET, SO_PEERCRED, &creds, &szCreds);
 
     if (err == 0 && szCreds > 0) {
         errno = 0;
@@ -2653,8 +2727,9 @@ static void listenCallback (int fd, short flags, void *param) {
     if ( !is_phone_socket ) {
       ALOGE("RILD must accept socket from %s", PHONE_PROCESS);
 
-      close(fd);
-      fd = -1;
+         close(s_fdCommand[client_id]);
+        s_fdCommand[client_id] = -1;
+        client_fds[client_id].fd_status = FD_STATUS_INACTIVE;
 
       onCommandsSocketClosed();
 
@@ -2668,15 +2743,16 @@ static void listenCallback (int fd, short flags, void *param) {
     }
 
     p_rsInfo = new RecordStreamInfo();
-    p_rsInfo->p_rs = record_stream_new(fd, MAX_COMMAND_BYTES);
+    p_rsInfo->p_rs = record_stream_new(s_fdCommand[client_id], MAX_COMMAND_BYTES);
     p_record = (char *)malloc(sizeof(char) * SUB_DATA_LENGTH);
 
-    ret = read(fd, p_record, SUB_DATA_LENGTH);
+    ret = read(s_fdCommand[client_id], p_record, SUB_DATA_LENGTH);
     if (ret <= 0) {
         ALOGE("Client is not passing proper subscription values");
 
-        close(fd);
-        fd = -1;
+        close(s_fdCommand[client_id]);
+        s_fdCommand[client_id] = -1;
+        client_fds[client_id].fd_status = FD_STATUS_INACTIVE;
         onCommandsSocketClosed();
 
         // s_listen_event is persistent. So, delete the listen event from
@@ -2697,22 +2773,26 @@ static void listenCallback (int fd, short flags, void *param) {
         ALOGE("Should not come here !!! buffer red :: %s", p_record);
     }
 
-    s_fdCommand[p_rsInfo->client_id] = fd;
+    s_fdCommand[p_rsInfo->client_id] = s_fdCommand[client_id];
 
     ALOGI("libril: new connection");
 
-    ret = fcntl(fd, F_SETFL, O_NONBLOCK);
+    ret = fcntl(s_fdCommand[client_id], F_SETFL, O_NONBLOCK);
 
     if (ret < 0) {
 	ALOGE ("Error setting O_NONBLOCK errno:%d", errno);
     }
 
+    ALOGI("libril: new connection");
+
+    p_rs[p_rsInfo->client_id] = record_stream_new(s_fdCommand[p_rsInfo->client_id], MAX_COMMAND_BYTES);
+
     ril_event_set (&s_commands_event[p_rsInfo->client_id], s_fdCommand[p_rsInfo->client_id], 1,
-        processCommandsCallback, p_rsInfo);
+        processCommandsCallback, p_rs[p_rsInfo->client_id]);
 
     rilEventAddWakeup (&s_commands_event[p_rsInfo->client_id]);
 
-    onNewCommandConnect(p_rsInfo->client_id);
+    onNewCommandConnect(s_fdCommand[p_rsInfo->client_id]);
 }
 
 static void freeDebugCallbackArgs(int number, char **args) {
@@ -2741,6 +2821,18 @@ static void debugCallback (int fd, short flags, void *param) {
 
     acceptFD = accept (fd,  (sockaddr *) &peeraddr, &socklen);
 
+    int client_id = addClientFd(acceptFD);
+    if(client_id == -1)
+    {
+        ALOGE("Max no of clients reached");
+        close(acceptFD);
+        return ;
+    }
+    else
+    {
+        s_fdCommand[client_id] = acceptFD;
+    }
+
     if (acceptFD < 0) {
         ALOGE ("error accepting on debug port: %d\n", errno);
         return;
@@ -2755,7 +2847,7 @@ static void debugCallback (int fd, short flags, void *param) {
         return;
     }
 
-    int client_id = 0;
+    client_id = 0;
     if (strncmp(p_record, SUB1, SUB_DATA_LENGTH) == 0) {
         client_id = 0;
         ALOGI("Debug Client ID :: %d", client_id);
@@ -3702,6 +3794,61 @@ requestToString(int request) {
         case RIL_UNSOL_VOICE_RADIO_TECH_CHANGED: return "UNSOL_VOICE_RADIO_TECH_CHANGED";
         default: return "<unknown request>";
     }
+}
+
+#if 0  //for SKU9-TEMP
+int isMultiSimEnabled()
+{
+    int enabled = 0;
+    char prop_val[PROPERTY_VALUE_MAX];
+    if (property_get("persist.dsds.enabled", prop_val, "0") > 0)
+    {
+        if (strncmp(prop_val, "true", 4) == 0) {
+            enabled = 1;
+        }
+        ALOGE("isMultiSimEnabled: prop_val = %s enabled = %d", prop_val, enabled);
+    }
+    return enabled;
+}
+#else
+int isMultiSimEnabled()
+{
+    int enabled = 0;
+    char prop_val[PROPERTY_VALUE_MAX];
+    if (property_get("persist.multisim.config", prop_val, "0") > 0)
+    {
+        if ((strncmp(prop_val, "dsds", 4) == 0) || (strncmp(prop_val, "dsda", 4) == 0)) {
+            enabled = 1;
+        }
+        ALOGE("isMultiSimEnabled: prop_val = %s enabled = %d", prop_val, enabled);
+    }
+    return enabled;
+}
+#endif
+int isMultiRild()
+{
+    int enabled = 0;
+    char prop_val[PROPERTY_VALUE_MAX];
+    if (property_get("ro.multi.rild", prop_val, "0") > 0)
+    {
+        if (strncmp(prop_val, "true", 4) == 0) {
+            enabled = 1;
+        }
+        ALOGD("isMultiRild: prop_val = %s enabled = %d", prop_val, enabled);
+    }
+    return enabled;
+}
+
+
+void lock6610At()
+{
+	pthread_mutex_lock(&s_6610AtMutex);
+}
+
+void unlock6610At()
+{	
+	pthread_mutex_unlock(&s_6610AtMutex);
+	
 }
 
 } /* namespace android */

@@ -35,11 +35,23 @@
 
 #include <private/android_filesystem_config.h>
 #include "hardware/qemu_pipe.h"
+#include <pthread.h>
+
+#include <termios.h>
+
 
 #define LIB_PATH_PROPERTY   "rild.libpath"
 #define LIB_ARGS_PROPERTY   "rild.libargs"
 #define MAX_LIB_ARGS        16
 #define NUM_CLIENTS 	    2
+
+#define DSDARILPATH           "/system/lib/libscril.so"
+#define DSDARILPATH0           "/system/lib/libscril0.so"
+
+
+const RIL_RadioFunctions *funcs_inst_for_sim0[NUM_CLIENTS] = {NULL, NULL};
+const RIL_RadioFunctions *funcs_inst[NUM_CLIENTS] = {NULL, NULL};
+static int last_switch_state = 0;
 
 static void usage(const char *argv0)
 {
@@ -106,20 +118,305 @@ void switchUser() {
     capset(&header, &cap);
 }
 
+#if 0  // for SKU2, not for SKU1
+//add for switching sim1 between CDMA and GSM
+void *thread_function(void *arg)
+{
+    char switch_state[10]= {0};
+    //char old_switch_state[10]= {0};
+reset:
+    while(1){
+        property_get("gsm.switch.cdma",switch_state,"0");
+        //property_get("gsm.switch.oldstate",old_switch_state,"0");
+        //if(('1' == switch_state[0]) && ('0' == old_switch_state[0])){
+        if(('1' == switch_state[0]) && (0 == last_switch_state)){
+            //switch sim0 from MSM8625 to SC6610
+            last_switch_state = 1;
+            //property_set("gsm.switch.oldstate","1");
+            ALOGE("Register the callbacks func for switching sim0 from MSM8625 to SC6610");
+            system("echo GSM > /sys/class/switch/sim-slot/switch");
+            RIL_setcallbacks(funcs_inst_for_sim0[0], 0);
+        }else if(('0' == switch_state[0]) && (1 == last_switch_state)){
+            //switch sim1 from SC6610 to MSM8625
+            last_switch_state = 0;
+            system("echo CDMA > /sys/class/switch/sim-slot/switch");
+            ALOGE("Register the callbacks func for switching sim0 from SC6610 to MSM8625");
+            RIL_setcallbacks(funcs_inst[0], 0);
+        }
+        sleep(2);
+    }
+    return NULL;
+}
+#endif
+
+#if 1  // for mux
+/*
+* Purpose:  Open and initialize the serial device used.
+* Input:      serial - the serial struct
+* Return:    0 if port successfully opened, else 1.
+*/
+int open_serial_device(const char* 	devicename, speed_t speed)
+{
+  int file_ptr = 0;
+
+	struct termios options;
+
+	ALOGE("open_serial_device Enter");
+
+	file_ptr = open(devicename, O_RDWR | O_NOCTTY | O_NDELAY);
+	//file_ptr = open("/dev/ttyMSMSKU92", O_RDWR | O_NOCTTY | O_NDELAY);
+	if (-1 == file_ptr) {
+		printf("Could not open uart port \n");
+		return(-1);
+	}
+
+	ioctl(file_ptr, TCGETS, &options);
+	options.c_cc[VTIME]    = 0;   /* inter-character timer unused */
+	options.c_cc[VMIN]     = 2;   /* blocking read until 5 chars received */
+
+	options.c_cflag &= ~CSIZE;
+	options.c_cflag |= (CS8 | CLOCAL | CREAD |CRTSCTS);
+	options.c_iflag = IGNPAR;
+        options.c_oflag = 0;
+	options.c_lflag = 0;
+
+	cfsetospeed(&options, speed);
+	cfsetispeed(&options, speed);
+	ioctl(file_ptr, TCSETS, &options);
+
+		/* Blocking behavior */
+	fcntl(file_ptr, F_SETFL, 0);
+
+#if 0
+  /* open the serial port */
+	if ((fd = open(devicename, O_RDWR | O_NOCTTY | O_NONBLOCK)) < 0)
+  {
+    ALOGE("open_serial_device F1 %s [%d]", strerror(errno), errno);
+    return -1;
+  }
+
+	ALOGE("Opened serial port");
+
+	int fdflags;
+	if ((fdflags = fcntl(fd, F_GETFL)) < 0)
+  {
+    ALOGE("open_serial_device F2 %s [%d]", strerror(errno), errno);
+    return -1;
+  }
+	if (fcntl(fd, F_SETFL, fdflags & ~O_NONBLOCK) < 0)
+  {
+    ALOGE("open_serial_device F2 %s [%d]", strerror(errno), errno);
+    return -1;
+  }
+
+	struct termios t;
+  tcgetattr(fd, &t);
+
+  t.c_cc[VTIME]    = 0;
+	t.c_cc[VMIN]     = 0;
+
+	t.c_cflag &= ~CSIZE;
+	t.c_cflag |= (CS8 | CLOCAL | CREAD);
+	t.c_cflag &=~PARENB;
+	t.c_cflag |= CRTSCTS;
+	t.c_iflag = IGNPAR;
+        t.c_oflag = 0;
+	t.c_lflag = 0;
+
+	//Android does not directly define _POSIX_VDISABLE. It can be fetched using pathconf()
+	long posix_vdisable;
+	char cur_path[FILENAME_MAX];
+	if (!getcwd(cur_path, sizeof(cur_path))){
+		ALOGE("_getcwd returned error: %s [%d]", strerror(errno), errno);
+		return 1;
+	}
+	posix_vdisable = pathconf(cur_path, _PC_VDISABLE);
+	t.c_cc[VINTR] = posix_vdisable;
+	t.c_cc[VQUIT] = posix_vdisable;
+	t.c_cc[VSTART] = posix_vdisable;
+	t.c_cc[VSTOP] = posix_vdisable;
+	t.c_cc[VSUSP] = posix_vdisable;
+
+	speed_t speed = B115200;
+	cfsetispeed(&t, speed);
+	cfsetospeed(&t, speed);
+
+  ioctl(fd, TCSETS, &t);
+#endif
+
+	ALOGE("Configured serial device");
+
+	return file_ptr;
+}
+
+#if 0
+/*
+* Purpose:  Compares two strings.
+*                strstr might not work because WebBox sends garbage before the first OK
+*                when it's not needed anymore
+* Input:      haystack - string to check
+*                length - length of string to check
+*                needle - reference string to compare to. must be null-terminated.
+* Return:    1 if comparison was success, else 0
+*/
+static int memstr(
+	const char *haystack,
+	int length,
+	const char *needle)
+{
+	int i;
+	int j = 0;
+	if (needle[0] == '\0')
+		return 1;
+	for (i = 0; i < length; i++)
+		if (needle[j] == haystack[i])
+		{
+			j++;
+			if (needle[j] == '\0') // Entire needle was found
+				return 1;
+		}
+		else
+			j = 0;
+	return 0;
+}
+
+/*
+* Purpose:  Sends an AT-command to a given serial port and waits for reply.
+* Input:      fd - file descriptor
+*                cmd - command
+*                to - how many seconds to wait for response
+* Return:   0 on success (OK-response), -1 otherwise
+*/
+static int chat(
+	int serial_device_fd,
+	const char *cmd,
+	int to)
+{
+	ALOGE("chat Enter");
+	unsigned char buf[1024];
+	int sel;
+	int len;
+	int wrote = 0;
+	ALOGE(">s %s", cmd);
+	if ((wrote = write(serial_device_fd, cmd, strlen(cmd))) < 0)
+  {
+    ALOGE("chat F1 %s [%d]", strerror(errno), errno);
+    return -1;
+  }
+	ALOGE("Wrote %d bytes", wrote);
+
+  ioctl(serial_device_fd, TCSBRK, 1); //equivalent to tcdrain for andriod
+
+	fd_set rfds;
+	FD_ZERO(&rfds);
+	FD_SET(serial_device_fd, &rfds);
+	struct timeval timeout;
+	timeout.tv_sec = to;
+	timeout.tv_usec = 0;
+	do
+	{
+		if ((sel = select(serial_device_fd + 1, &rfds, NULL, NULL, &timeout)) < 0)
+    {
+      ALOGE("chat F2 %s [%d]", strerror(errno), errno);
+      return -1;
+    }
+		ALOGE("Selected %d", sel);
+		if (FD_ISSET(serial_device_fd, &rfds))
+		{
+			memset(buf, 0, sizeof(buf));
+			if ((len = read(serial_device_fd, buf, sizeof(buf))) < 0)
+      {
+        ALOGE("chat F3 %s [%d]", strerror(errno), errno);
+        return -1;
+      }
+
+      ALOGE("Read %d bytes from serial device", len);
+      unsigned char tmpc = buf[len];
+      buf[len] = '\0';
+			ALOGE("<s %s", buf);
+      buf[len] = tmpc;
+			errno = 0;
+			if (memstr((char *) buf, len, "OK"))
+			{
+				ALOGE("Received OK");
+				return 0;
+			}
+			if (memstr((char *) buf, len, "ERROR"))
+			{
+				ALOGE("Received ERROR");
+				return -1;
+			}
+		}
+	} while (sel);
+	return -1;
+}
+#endif
+
+static void *
+openSerial(void *param){
+    int try_times = 10;
+    int fd = 0;
+    FILE *fp;
+    char platform_version[8];
+
+    fp = fopen("/sys/devices/system/soc/soc0/platform_version", "r");
+    if(!fp)
+    {
+      ALOGE("MUXTest Opened serial: read config file failed.");
+    }
+
+    if (fp && fgets(platform_version, sizeof(platform_version), fp) && !strncmp(platform_version, "131072", 6))
+    {
+        ALOGE("MUXTest Opened serial: /dev/ttyMSM2");
+        fd = open_serial_device("/dev/ttyMSM2", B115200);
+    }
+    else
+    {
+        ALOGE("MUXTest Opened serial: /dev/ttyHSL0");
+        fd = open_serial_device("/dev/ttyHSL0", B460800);
+    }
+    ALOGE("MUXTest Opened serial dev.%d", fd);
+    fclose(fp);
+
+#if 0
+    ALOGE("MUXTest Chat.");
+    while (chat(fd, "AT\r\n", 1) < 0)
+    {
+      if (!(--try_times)) {
+        ALOGE("Modem does not respond to AT commands in 10 times, trying close mux mode");
+        break;
+      }
+      //LOGE("Modem does not respond to AT commands in 2 seconds, sleep 1 second and trying again.");
+      //sleep(1);
+    }
+#endif
+    return NULL;
+}
+#endif
+
 int main(int argc, char **argv)
 {
     const char * rilLibPath = NULL;
     char **rilArgv;
     static char * s_argv[MAX_LIB_ARGS];
     void *dlHandle;
+    void *simdlHandle;
     const RIL_RadioFunctions *(*rilInit)(const struct RIL_Env *, int, char **);
-    const RIL_RadioFunctions *funcs_inst[NUM_CLIENTS] = {NULL, NULL};
+    const RIL_RadioFunctions *(*DSDARILInit)(const struct RIL_Env *, int, char **); 
     char libPath[PROPERTY_VALUE_MAX];
     unsigned char hasLibArgs = 0;
     int j = 0;
     int i;
     static char client[3] = {'0'};
     int numClients = 1;
+
+#if 0 //for SKU2, not for SKU1
+    //add for switching sim0 between CDMA and GSM
+    void *simdlHandle_for_sim0;
+    const RIL_RadioFunctions *(*DSDARILInit_for_sim0)(const struct RIL_Env *, int, char **);
+    pthread_t a_thread;
+    int res;
+#endif
 
     ALOGE("**RIL Daemon Started**");
     ALOGE("**RILd param count=%d**", argc);
@@ -267,6 +564,16 @@ OpenLib:
 #endif
     switchUser();
 
+#if 1 //for mux
+    {//if(1 == DSDARIL_modem_dev){
+        pthread_t s_tid_openserial;
+        pthread_attr_t attr1;
+        pthread_attr_init (&attr1);
+        pthread_attr_setdetachstate(&attr1, PTHREAD_CREATE_DETACHED);
+        pthread_create(&s_tid_openserial, &attr1, openSerial, NULL);
+    }    
+#endif
+
     dlHandle = dlopen(rilLibPath, RTLD_NOW);
 
     if (dlHandle == NULL) {
@@ -283,6 +590,46 @@ OpenLib:
         fprintf(stderr, "RIL_Init not defined or exported in %s\n", rilLibPath);
         exit(-1);
     }
+
+////////////////////////////////////////////////////////////////////////////////
+    //add DSDARIL
+    if (isMultiSimEnabled() && !isMultiRild()){
+        ALOGE("dlopen DSDARILLibPath: %s",DSDARILPATH);
+
+        simdlHandle = dlopen(DSDARILPATH, RTLD_NOW);
+
+        if (simdlHandle == NULL) {
+            ALOGE("**dl open DSDARIL failed **");
+            fprintf(stderr, "dlopen failed: %s\n", dlerror());
+            exit(-1);
+        }
+        DSDARILInit = (const RIL_RadioFunctions *(*)(const struct RIL_Env *, int, char **))dlsym(simdlHandle, "RIL_Init");
+
+        if (DSDARILInit == NULL) {
+            ALOGE("**get DSDARIL RIL_Init() failed **");
+            fprintf(stderr, "RIL_Init not defined or exported in %s\n", DSDARILPATH);
+            exit(-1);
+        }
+#if 0   //for SKU2, not for SKU1
+        //add for switching sim0 between CDMA and GSM
+        simdlHandle_for_sim0 = dlopen(DSDARILPATH0, RTLD_NOW);
+
+        if (simdlHandle_for_sim0 == NULL) {
+            ALOGE("**dl open DSDARIL for sim0 failed **");
+            fprintf(stderr, "dlopen for sim0 failed: %s\n", dlerror());
+            //exit(-1);
+        }else{
+            DSDARILInit_for_sim0 = (const RIL_RadioFunctions *(*)(const struct RIL_Env *, int, char **))dlsym(simdlHandle_for_sim0, "RIL_Init");
+
+            if (DSDARILInit_for_sim0 == NULL) {
+                ALOGE("**get DSDARIL RIL_Init() for sim0 failed **");
+                fprintf(stderr, "RIL_Init not defined or exported for sim0 in %s\n", DSDARILPATH0);
+                //exit(-1);
+            }
+        }
+#endif
+    }
+////////////////////////////////////////////////////////////////////////////////
 
     if (hasLibArgs) {
         argc = argc-i+1;
@@ -304,8 +651,21 @@ OpenLib:
     if (isMultiSimEnabled() && !isMultiRild()) {
 	s_argv[argc-1] = "1";  //client id incase of single rild managing two instances of RIL
         ALOGE("RIL_Init argc = %d client = %s",argc, s_argv[argc-1]);
-        funcs_inst[1] = rilInit(&s_rilEnv2, argc, s_argv);
+        funcs_inst[1] = DSDARILInit(&s_rilEnv2, argc, s_argv);
         numClients++;
+
+#if 0   // for SKU2, not for SKU1
+        if(NULL == DSDARILInit_for_sim0){
+        }else{
+            //add for switching sim0 between CDMA and GSM
+            s_argv[argc-1] = "0";  //client id incase of single rild managing two instances of RIL for sim0
+            ALOGE("RIL_Init for sim 0 argc = %d client = %s",argc, s_argv[argc-1]);
+            funcs_inst_for_sim0[0] = DSDARILInit_for_sim0(&s_rilEnv, argc, s_argv);
+            if(NULL == funcs_inst_for_sim0[0]){
+                ALOGE("RIL_Init for sim 0 fail ");
+            }
+        }
+#endif
     }
 
     RIL_setMaxNumClients(numClients);
@@ -314,6 +674,18 @@ OpenLib:
     for (i = 0; i < numClients; i++) {
         RIL_register(funcs_inst[i], i);
     }
+
+#if 0 //for SKU2, not for SKU1
+    if(NULL == DSDARILInit_for_sim0){
+    }else{
+        //add for switching sim0 between CDMA and GSM
+        res = pthread_create(&a_thread, NULL, thread_function, NULL);
+        if(0 != res){
+            ALOGE("RILD pthread_create fail, res = %d ",res);
+        }
+    }
+#endif
+
 done:
 
     while(1) {
@@ -321,6 +693,22 @@ done:
         sleep(0x00ffffff);
     }
 }
+
+#if 0  //for SKU9-TEMP
+int isMultiSimEnabled()
+{
+    int enabled = 0;
+    char prop_val[PROPERTY_VALUE_MAX];
+    if (property_get("persist.dsds.enabled", prop_val, "0") > 0)
+    {
+        if (strncmp(prop_val, "true", 4) == 0) {
+            enabled = 1;
+        }
+        ALOGE("isMultiSimEnabled: prop_val = %s enabled = %d", prop_val, enabled);
+    }
+    return enabled;
+}
+#else
 static int isMultiSimEnabled()
 {
     int enabled = 0;
@@ -334,6 +722,7 @@ static int isMultiSimEnabled()
     }
     return enabled;
 }
+#endif
 
 static int isMultiRild()
 {

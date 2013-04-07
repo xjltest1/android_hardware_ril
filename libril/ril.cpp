@@ -3143,7 +3143,7 @@ RIL_register (const RIL_RadioFunctions *callbacks, int client_id) {
 
 
     /*Make it persistent FD so that rild can listen for second client also */
-    rril_event_set (&s_listen_event, s_fdListen, true,
+    ril_event_set (&s_listen_event, s_fdListen, true,
                 listenCallback, NULL);
 
     rilEventAddWakeup (&s_listen_event);
